@@ -204,6 +204,23 @@ def analyze_stock(df: pd.DataFrame):
     return score, details, metrics
 
 
+def score_color(val) -> str:
+    """'Puan' sütunu için matplotlib gerektirmeyen, hafif bir arka plan rengi üretir.
+
+    pandas Styler.background_gradient() dahili olarak matplotlib ister; bu da
+    Streamlit Cloud gibi ortamlarda ekstra, ağır bir bağımlılık + kurulum
+    süresi demek. Bunun yerine puanı (0-5) yeşilin opaklığına eşleyen basit
+    bir CSS üretiyoruz.
+    """
+    try:
+        v = float(val)
+    except (TypeError, ValueError):
+        return ""
+    v = max(0.0, min(5.0, v))
+    alpha = 0.12 + (v / 5) * 0.55
+    return f"background-color: rgba(22, 163, 74, {alpha:.2f})"
+
+
 # ----------------------------------------------------------------------------
 # Grafik
 # ----------------------------------------------------------------------------
@@ -284,7 +301,7 @@ with st.sidebar:
     period = st.selectbox("Geçmiş veri aralığı", ["6mo", "1y", "2y"], index=0)
     min_score = st.slider("Minimum puan filtresi (izleme listesi için)", 0, 5, 3)
 
-    run = st.button("🔍 Taramayı Başlat", type="primary", use_container_width=True)
+    run = st.button("🔍 Taramayı Başlat", type="primary", width="stretch")
 
 if "scan" not in st.session_state:
     st.session_state.scan = None
@@ -356,8 +373,8 @@ else:
                         "Kapanış": "{:.2f}", "Değişim %": "{:+.2f}", "RSI(14)": "{:.1f}",
                         "EMA20": "{:.2f}", "EMA50": "{:.2f}", "Hacim Oranı": "{:.2f}x",
                         "Tetik Seviyesi (20g Yüksek)": "{:.2f}",
-                    }).background_gradient(subset=["Puan"], cmap="Greens"),
-                    use_container_width=True, hide_index=True,
+                    }).map(score_color, subset=["Puan"]),
+                    width="stretch", hide_index=True,
                 )
                 csv = watchlist.to_csv(index=False).encode("utf-8-sig")
                 st.download_button("⬇️ İzleme listesini CSV olarak indir", csv, "izleme_listesi.csv", "text/csv")
@@ -369,7 +386,7 @@ else:
                     "EMA20": "{:.2f}", "EMA50": "{:.2f}", "Hacim Oranı": "{:.2f}x",
                     "Tetik Seviyesi (20g Yüksek)": "{:.2f}",
                 }),
-                use_container_width=True, hide_index=True,
+                width="stretch", hide_index=True,
             )
 
         if scan["failed"]:
@@ -389,4 +406,4 @@ else:
             with st.expander("Kriter detayları"):
                 for label, ok in details.items():
                     st.write(("✅ " if ok else "❌ ") + label)
-            st.plotly_chart(build_chart(df, chosen), use_container_width=True)
+            st.plotly_chart(build_chart(df, chosen), width="stretch")
