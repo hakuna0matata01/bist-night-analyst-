@@ -7,15 +7,40 @@ teknik kriterlere göre puanlayıp ertesi gün için kısa bir **izleme listesi*
 > ⚠️ Bu araç yatırım tavsiyesi değildir. Sadece teknik kriterlere dayalı bir
 > ön-eleme/tarama aracıdır.
 
-## Puanlama Mantığı (5 üzerinden)
+## Puanlama Mantığı (v2 — maks. 7 puan, risk cezalı)
+
+**Pozitif kriterler (her biri +1):**
 
 | # | Kriter | Açıklama |
 |---|--------|----------|
-| 1 | Trend | Fiyat > EMA20 ve Fiyat > EMA50 |
+| 1 | Trend | Fiyat > EMA20 > EMA50 (boğa dizilişi — sadece fiyat>EMA değil) |
 | 2 | Momentum | RSI(14) 40-65 bandında ve yükseliyor |
 | 3 | MACD | MACD çizgisi sinyalin üzerinde, histogram güçleniyor |
-| 4 | Hacim | Günlük hacim 20 günlük ortalamanın üzerinde + fiyat yukarı |
+| 4 | Hacim | Günlük hacim 20g ortalamanın **1.3x** üzerinde + fiyat yukarı |
 | 5 | Seviye | Direnç kırılımı/yakınlığı ya da sıkışma (düşük volatilite) sonrası |
+| 6 | ADX | ADX(14) ≥ eşik (trend gerçekten güçlü mü, yoksa yatay/gürültülü mü?) |
+| 7 | Göreli Güç | Son 20 günde **BIST100 endeksinden** daha güçlü performans |
+
+**Risk cezaları (her biri -1, toplam puan 0'ın altına inmez):**
+
+| Bayrak | Açıklama |
+|--------|----------|
+| Aşırı uzama | Fiyat, EMA20'nin %10+ üzerinde (kovalama/geri çekilme riski) |
+| Marj sınırı | Bugünkü değişim zaten ±%9+ (yarın için gap/tepki riski) |
+
+**Ek bağlam ve filtreler:**
+- **Piyasa rejimi:** BIST100 endeksinin kendi trendi (EMA50 üzerinde mi) üstte
+  bir bilgi/uyarı panosu olarak gösterilir. Endeks zayıfken bireysel sinyaller
+  istatistiksel olarak daha az güvenilir olma eğilimindedir.
+- **Likidite filtresi:** 20 günlük ortalama TL cirosu, sol menüden
+  belirlenen eşiğin altındaki hisseler izleme listesinden (isteğe bağlı,
+  varsayılan açık) hariç tutulur — ince/az işlem gören hisselerde teknik
+  sinyaller güvenilmezdir ve pratikte alım/satımı da zor olabilir.
+- **Tarihsel Başarı Oranı:** Her hissenin **kendi geçmiş verisinde**, aynı
+  puan eşiğini geçtiği günlerden sonraki günün pozitif kapanma oranı ve
+  ortalama getirisi hesaplanır (vektörize mini-backtest). Yeterli sinyal
+  yoksa (<5) "—" gösterilir. **Bu geçmiş performanstır, gelecekteki sonucu
+  garanti etmez.**
 
 Bu, stratejinin **Faz 2** (sabah 10:30 sonrası Relative Volume teyidi ve
 alım) adımından önceki hazırlık aşamasıdır; Faz 2 ayrı bir uygulama/modül
@@ -86,10 +111,18 @@ Uygulama üç kaynaktan hisse listesi alabilir (sol menüden seçilir):
 
 ## Özelleştirme
 
-- **Eşik değerleri:** `analyze_stock()` fonksiyonu içindeki RSI bandı (40-65),
-  hacim çarpanı, direnç toleransı (%2) gibi değerler koda gömülüdür; kendi
-  stratejinize göre bu sabitleri değiştirebilirsiniz.
-- **Minimum puan filtresi:** Arayüzden (sidebar) canlı olarak ayarlanabilir.
+- **Arayüzden canlı ayarlanabilenler:** minimum puan eşiği, minimum ADX
+  eşiği, minimum ortalama günlük ciro (likidite), düşük likiditeyi hariç
+  tutma, geçmiş veri aralığı.
+- **Kodda sabit olan eşikler** (`app.py` başındaki sabitler): RSI bandı
+  (40-65), hacim çarpanı (1.3x), direnç toleransı (%2), aşırı uzama eşiği
+  (`OVEREXTENSION_PCT`, %10), marj sınırı eşiği (`NEAR_LIMIT_PCT`, %9),
+  göreli güç bakış penceresi (20 gün), minimum backtest sinyal sayısı
+  (`MIN_BACKTEST_SIGNALS`, 5). Kendi stratejinize göre bu sabitleri
+  değiştirebilirsiniz.
+- **Endeks referansı:** Göreli güç ve piyasa rejimi notu `INDEX_TICKER =
+  "XU100.IS"` (BIST100) üzerinden hesaplanır; isterseniz başka bir endekse
+  çevirebilirsiniz.
 - **Hisse listesini güncelleme:** isyatirim.com veya BIST'in resmi
   kaynaklarından yeni bir liste alıp `data/bist_tickers.txt` dosyasının
   içeriğini (bir satır = bir hisse kodu, `.IS` olmadan) değiştirerek
@@ -107,4 +140,8 @@ resmi veri kaynaklarıyla teyit edin.
 - Faz 2 (sabah RVOL teyidi + VWAP kontrolü) için ayrı bir sayfa/sekme eklemek
 - Tarama sonuçlarını otomatik olarak her akşam GitHub Actions ile çalıştırıp
   sonucu bir CSV/Telegram bildirimi olarak almak
-- Backtest modülü ekleyerek puanlama eşiklerinin geçmiş performansını ölçmek
+- Walk-forward / tüm-liste genelinde toplu backtest (şu an her hissenin
+  kendi geçmişiyle sınırlı; sektörler arası veya tüm BIST genelinde
+  karşılaştırmalı bir backtest eklenebilir)
+- Sektör bazlı gruplama ve sektör göreli gücü (tek tek hisse yerine sektör
+  rotasyonunu da dikkate almak)
