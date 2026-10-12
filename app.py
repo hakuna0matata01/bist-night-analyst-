@@ -65,6 +65,7 @@ MAX_POSITIVE_CRITERIA = 7   # Pozitif kriter sayısı (puanın üst sınırı)
 OVEREXTENSION_PCT = 0.10    # EMA20'nin bu oranın üzerinde ise "aşırı uzamış" say
 NEAR_LIMIT_PCT = 9.0        # Günlük değişim bu yüzdeyi geçerse "marj sınırına yakın" say
 MIN_BACKTEST_SIGNALS = 5    # Tarihsel başarı oranını göstermek için gereken min. sinyal sayısı
+DEFAULT_TRIGGER_BUFFER_PCT = 0.5  # Giriş tetik seviyesi için referans direncin üzerine eklenen tampon (%)
 
 
 @st.cache_data(show_spinner=False)
@@ -203,7 +204,12 @@ def adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14):
 # hesaplar. Böylece hem "bugünkü" puan hem de tarihsel backtest aynı,
 # tutarlı formülden üretilir.
 # ----------------------------------------------------------------------------
-def build_indicator_set(df: pd.DataFrame, index_close: pd.Series = None, adx_threshold: int = 20) -> dict:
+def build_indicator_set(
+    df: pd.DataFrame,
+    index_close: pd.Series = None,
+    adx_threshold: int = 20,
+    trigger_buffer_pct: float = DEFAULT_TRIGGER_BUFFER_PCT,
+) -> dict:
     close, high, low, volume = df["Close"], df["High"], df["Low"], df["Volume"]
 
     ema20 = ema(close, 20)
@@ -237,6 +243,15 @@ def build_indicator_set(df: pd.DataFrame, index_close: pd.Series = None, adx_thr
     bw_q20 = bw.rolling(60, min_periods=30).quantile(0.2)
     squeeze = bw <= bw_q20
     level_ok = breakout | near_resistance | squeeze
+
+    # Giriş tetik seviyesi: "dünkü direncin birazı üzeri" — eğer hisse bugün zaten
+    # kırılım yaptıysa (close >= recent_high20), referans olarak bugünün kapanışını
+    # alır (devam/sürdürme teyidi istenir); henüz kırmadıysa referans direncin
+    # kendisidir. İkisinin büyük olanı + küçük bir tampon = yarın izlenecek fiyat.
+    # Tampon, farklı fiyat seviyelerindeki yüzlerce hissede tutarlı kalması için
+    # sabit kuruş yerine yüzde olarak uygulanır.
+    reference_level = pd.concat([recent_high20, close], axis=1).max(axis=1)
+    entry_trigger = reference_level * (1 + trigger_buffer_pct / 100)
 
     # 6. ADX: trend gerçekten güçlü mü (yatay/sahte kırılımları ele)
     adx_ok = adx14 >= adx_threshold
@@ -287,6 +302,7 @@ def build_indicator_set(df: pd.DataFrame, index_close: pd.Series = None, adx_thr
         "adx14": adx14, "rel_strength": rel_strength,
         "vol_ratio": vol_ratio, "recent_high20": recent_high20,
         "chg_pct": chg_pct, "avg_turnover20": avg_turnover20,
+        "reference_level": reference_level, "entry_trigger": entry_trigger,
     }
 
 
@@ -312,7 +328,12 @@ def evaluate_today(ind: dict) -> tuple:
         "Hacim Oranı": _safe(ind["vol_ratio"]),
         "Gör. Güç 20g %": _safe(ind["rel_strength"]),
         "Ort. Ciro (M TL)": _safe(ind["avg_turnover20"]) / 1e6 if pd.notna(ind["avg_turnover20"].iloc[idx]) else np.nan,
-        "Tetik Seviyesi": _safe(ind["recent_high20"]) if pd.notna(ind["recent_high20"].iloc[idx]) else _safe(ind["close"]),
+        "Referans Direnç": _safe(ind["reference_level"]),
+        "Giriş Tetik Fiyatı": _safe(ind["entry_trigger"]),
+        "Tetiğe Uzaklık %": (
+            (_safe(ind["entry_trigger"]) / _safe(ind["close"]) - 1) * 100
+            if pd.notna(ind["entry_trigger"].iloc[idx]) and _safe(ind["close"]) else np.nan
+        ),
     }
     return score, details, risk, metrics
 
@@ -358,6 +379,14 @@ def build_chart(df: pd.DataFrame, ind: dict, ticker: str) -> go.Figure:
     ), row=1, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=ind["ema20"], name="EMA20", line=dict(width=1.3, color="#3b82f6")), row=1, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=ind["ema50"], name="EMA50", line=dict(width=1.3, color="#f97316")), row=1, col=1)
+
+    trigger_price = ind["entry_trigger"].iloc[-1]
+    if pd.notna(trigger_price):
+        fig.add_hline(
+            y=float(trigger_price), line_dash="dash", line_color="#d97706", line_width=2,
+            annotation_text=f"Giriş Tetik: {trigger_price:.2f}", annotation_position="top left",
+            row=1, col=1,
+        )
 
     vol_colors = np.where(df["Close"] >= df["Open"], "#16a34a", "#dc2626")
     fig.add_trace(go.Bar(x=df.index, y=df["Volume"], marker_color=vol_colors, name="Hacim", showlegend=False), row=2, col=1)
@@ -426,6 +455,15 @@ with st.sidebar:
     adx_threshold = st.slider("Minimum ADX(14) — trend gücü eşiği", 10, 40, 20)
     min_turnover_m = st.number_input("Minimum ort. günlük ciro (Milyon TL, 20g)", min_value=0.0, value=20.0, step=5.0)
     exclude_illiquid = st.checkbox("Düşük likiditeli hisseleri izleme listesinden hariç tut", value=True)
+    trigger_buffer_pct = st.number_input(
+        "Giriş tetik tamponu (%) — referans direncin üzerine eklenir",
+        min_value=0.0, max_value=5.0, value=DEFAULT_TRIGGER_BUFFER_PCT, step=0.1,
+    )
+    st.caption(
+        "Yarın izlenecek fiyat = (dünkü direnç ya da bugünün kapanışından büyük olanı) "
+        "× (1 + tampon). Sabit kuruş yerine yüzde kullanılır çünkü hisseler çok farklı "
+        "fiyat seviyelerinde işlem görüyor."
+    )
 
     run = st.button("🔍 Taramayı Başlat", type="primary", width="stretch")
 
@@ -452,7 +490,7 @@ if run:
             failed.append((ticker, "Veri yok / yetersiz"))
         else:
             try:
-                ind = build_indicator_set(df, index_close, adx_threshold)
+                ind = build_indicator_set(df, index_close, adx_threshold, trigger_buffer_pct)
                 score, details, risk, metrics = evaluate_today(ind)
                 bt = backtest_hit_rate(ind, min_score)
                 likidite_ok = bool(pd.notna(metrics["Ort. Ciro (M TL)"]) and metrics["Ort. Ciro (M TL)"] >= min_turnover_m)
@@ -531,13 +569,15 @@ else:
         watchlist = results_df[base_filter]
 
         display_cols = [
-            "Hisse", "Puan", "Kapanış", "Değişim %", "RSI(14)", "ADX(14)",
-            "Hacim Oranı", "Gör. Güç 20g %", "Ort. Ciro (M TL)",
+            "Hisse", "Puan", "Kapanış", "Değişim %",
+            "Giriş Tetik Fiyatı", "Tetiğe Uzaklık %", "Referans Direnç",
+            "RSI(14)", "ADX(14)", "Hacim Oranı", "Gör. Güç 20g %", "Ort. Ciro (M TL)",
             "Tarihsel Başarı %", "Sinyal Sayısı", "Ort. Sonraki Gün Getiri %",
         ]
         fmt = {
-            "Kapanış": "{:.2f}", "Değişim %": "{:+.2f}", "RSI(14)": "{:.1f}",
-            "ADX(14)": "{:.1f}", "Hacim Oranı": "{:.2f}x", "Gör. Güç 20g %": "{:+.1f}",
+            "Kapanış": "{:.2f}", "Değişim %": "{:+.2f}",
+            "Giriş Tetik Fiyatı": "{:.2f}", "Tetiğe Uzaklık %": "{:+.2f}", "Referans Direnç": "{:.2f}",
+            "RSI(14)": "{:.1f}", "ADX(14)": "{:.1f}", "Hacim Oranı": "{:.2f}x", "Gör. Güç 20g %": "{:+.1f}",
             "Ort. Ciro (M TL)": "{:.1f}", "Tarihsel Başarı %": "{:.0f}",
             "Ort. Sonraki Gün Getiri %": "{:+.2f}",
         }
@@ -552,7 +592,7 @@ else:
                 st.write("Bu eşiği geçen hisse yok. Eşiği düşürmeyi veya likidite filtresini gevşetmeyi deneyin.")
             else:
                 st.dataframe(
-                    watchlist[display_cols].style.format(fmt).map(score_color, subset=["Puan"]),
+                    watchlist[display_cols].style.format(fmt, na_rep="—").map(score_color, subset=["Puan"]),
                     width="stretch", hide_index=True,
                 )
                 csv = watchlist[display_cols].to_csv(index=False).encode("utf-8-sig")
@@ -560,7 +600,7 @@ else:
 
         with tab2:
             st.dataframe(
-                results_df[display_cols + ["Likidite OK"]].style.format(fmt),
+                results_df[display_cols + ["Likidite OK"]].style.format(fmt, na_rep="—"),
                 width="stretch", hide_index=True,
             )
 
@@ -578,6 +618,16 @@ else:
             row = results_df[results_df["Hisse"] == chosen].iloc[0]
 
             st.write(f"**Puan: {int(row['Puan'])} / {MAX_POSITIVE_CRITERIA}** (risk cezaları sonrası)")
+
+            trig_cols = st.columns(3)
+            trig_cols[0].metric("Giriş Tetik Fiyatı", f"{row['Giriş Tetik Fiyatı']:.2f} TL")
+            trig_cols[1].metric("Referans Direnç", f"{row['Referans Direnç']:.2f} TL")
+            trig_cols[2].metric("Tetiğe Uzaklık", f"{row['Tetiğe Uzaklık %']:+.2f}%")
+            st.caption(
+                f"Yarın fiyat **{row['Giriş Tetik Fiyatı']:.2f} TL** seviyesini yukarı keser, "
+                "Faz 2 kriterleri (yüksek Relative Volume + yön teyidi) sağlanırsa giriş "
+                "düşünülebilir. Bu seviye otomatik emir değildir, sadece izlenecek referanstır."
+            )
 
             with st.expander("✅ Kriter ve risk detayları", expanded=True):
                 st.markdown("**Pozitif kriterler:**")
