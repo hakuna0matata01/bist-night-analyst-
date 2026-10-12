@@ -42,6 +42,27 @@ teknik kriterlere göre puanlayıp ertesi gün için kısa bir **izleme listesi*
   yoksa (<5) "—" gösterilir. **Bu geçmiş performanstır, gelecekteki sonucu
   garanti etmez.**
 
+## Giriş Tetik Seviyesi
+
+Orijinal Faz 1 planındaki *"her biri için giriş tetik seviyesi (dünkü direncin
+X kuruş üzeri) not et"* adımı, sonuç tablosunda ayrı sütunlar olarak hesaplanır:
+
+- **Referans Direnç:** O gün için izlenecek direnç — hisse bugün henüz
+  direncini kırmadıysa, dünden bugüne taşınan 20 günlük direnç seviyesi; eğer
+  bugün zaten kırılım yaptıysa (daha önceki direncin üzerinde kapandıysa),
+  bugünün kapanışı yeni referans olur (devamlılık teyidi aranır).
+- **Giriş Tetik Fiyatı:** Referans Direnç × (1 + tampon%). Yarın fiyat bu
+  seviyeyi yukarı keserse (ve Faz 2'deki RVOL/yön teyidi de sağlanırsa) giriş
+  düşünülebilecek fiyat budur.
+- **Tetiğe Uzaklık %:** Bugünkü kapanışın tetik fiyatına olan yüzde mesafesi.
+
+**Neden sabit kuruş değil de yüzde tampon?** BIST'te hisseler birkaç TL'den
+binlerce TL'ye kadar çok farklı fiyat seviyelerinde işlem görüyor; 634 hissenin
+tamamında anlamlı kalması için tampon yüzde olarak uygulanır (sol menüden
+ayarlanabilir, varsayılan %0.5). Bu seviye grafik üzerinde turuncu kesikli
+çizgi olarak da işaretlenir ve İzleme Listesi CSV'sine dahildir — ertesi sabah
+Faz 2'de doğrudan kullanılabilir.
+
 Bu, stratejinin **Faz 2** (sabah 10:30 sonrası Relative Volume teyidi ve
 alım) adımından önceki hazırlık aşamasıdır; Faz 2 ayrı bir uygulama/modül
 olarak eklenebilir.
