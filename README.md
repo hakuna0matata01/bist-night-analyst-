@@ -1,5 +1,21 @@
 # BIST Akşam Taraması — Faz 1
 
+## v3 — Teknik Analiz Doğruluğunu Güçlendiren Düzenlemeler
+
+Bağımsız bir kod incelemesinde tespit edilen noktalara karşı yapılan değişiklikler:
+
+| # | Sorun | Çözüm |
+|---|-------|-------|
+| 1 | RSI/ADX, pandas `ewm(alpha=1/period)` ile **yaklaşık** Wilder smoothing kullanıyordu (kısa dönemlerde ~1 puana varan sapma) | `_wilder_rma()` ile klasik, SMA ile başlatılan **tam** Wilder özyinelemesi uygulandı. Sentetik veriyle test edildi: RSI artık klasik referansla **birebir** (fark = 0.0), ADX farkı 50. bardan sonra <0.2 puan |
+| 2 | Direnç seviyesi sadece **kapanış** fiyatlarına dayanıyordu, gün içi fitilleri yok sayıyordu | `recent_high20` artık **High** (günlük en yüksek) fiyatlara dayanıyor — daha standart bir direnç/kırılım tanımı |
+| 3 | Momentum kriteri (RSI 40-65) ile Seviye kriteri (direnç kırılımı) çelişiyordu: gerçek bir kırılım genelde RSI'ı 65'in üzerine taşır ve momentum puanını "cezalandırırdı" | Momentum artık iki senaryoyu kapsıyor: erken/orta aşama (RSI 40-65, yükseliyor) **veya** kırılım devamı (Seviye kriteri sağlanmışsa RSI 65-80 arası, yükseliyor). 80 üzeri hâlâ aşırı-alım sayılır |
+| 4 | Tarihsel başarı oranı tek hissenin kendi geçmişiyle sınırlıydı (n genelde 5-20, istatistiksel olarak zayıf) | Yeni **"Tüm evren bazlı tarihsel doğrulama"** paneli: taranan tüm hisselerin sinyal-günleri birleştirilip (cross-sectional) çok daha büyük bir örneklemle genel geçerlilik ölçülüyor. Hem tek-hisse hem tüm-evren sonuçlarına **%95 Wilson güven aralığı** eklendi (küçük örneklemde yanıltıcı kesinlik vermez) |
+| 5 | Yahoo Finance'in doğru ayarlamadığı bedelsiz sermaye artırımı/bölünme gibi olaylar, tüm göstergeleri (EMA/RSI/ADX) sessizce bozabiliyordu | Yeni `detect_data_quality_issue()`: tek günlük değişim %30'u geçerse (BIST'in fiili ±%10 bandının çok üzerinde) hisse "veri kalitesi sorunu" olarak işaretlenip analiz dışı bırakılıyor, ayrı bir listede gösteriliyor |
+| 6 | BIST100 endeksi çekilemezse, Göreli Güç kriteri sessizce devre dışı kalıyor ama arayüzde küçük bir notla geçiştiriliyordu | Artık belirgin bir uyarı (`st.error`) gösteriliyor ve o taramadaki **azami puanın 7 değil 6 olduğu** hem üstte hem her hissenin detay panelinde açıkça belirtiliyor |
+
+Bu değişiklikler puanlama **felsefesini** değiştirmez (hâlâ kural tabanlı bir ön-eleme aracıdır), sadece hesaplamaların standart tanımlarla tam örtüşmesini ve istatistiksel iddiaların (başarı oranı gibi) daha dürüst sunulmasını sağlar.
+
+
 Piyasa kapandıktan sonra (örn. saat 20:00) çalıştırılan, BIST hisselerini
 teknik kriterlere göre puanlayıp ertesi gün için kısa bir **izleme listesi**
 (watchlist) çıkaran bir Streamlit uygulaması.
@@ -7,19 +23,19 @@ teknik kriterlere göre puanlayıp ertesi gün için kısa bir **izleme listesi*
 > ⚠️ Bu araç yatırım tavsiyesi değildir. Sadece teknik kriterlere dayalı bir
 > ön-eleme/tarama aracıdır.
 
-## Puanlama Mantığı (v2 — maks. 7 puan, risk cezalı)
+## Puanlama Mantığı (v3 — maks. 7 puan, risk cezalı; endeks verisi yoksa azami 6)
 
 **Pozitif kriterler (her biri +1):**
 
 | # | Kriter | Açıklama |
 |---|--------|----------|
 | 1 | Trend | Fiyat > EMA20 > EMA50 (boğa dizilişi — sadece fiyat>EMA değil) |
-| 2 | Momentum | RSI(14) 40-65 bandında ve yükseliyor |
+| 2 | Momentum | RSI(14) 40-65 bandında ve yükseliyor **veya** (Seviye kriteri sağlanmışsa) RSI 65-80 arası ve yükseliyor |
 | 3 | MACD | MACD çizgisi sinyalin üzerinde, histogram güçleniyor |
 | 4 | Hacim | Günlük hacim 20g ortalamanın **1.3x** üzerinde + fiyat yukarı |
-| 5 | Seviye | Direnç kırılımı/yakınlığı ya da sıkışma (düşük volatilite) sonrası |
-| 6 | ADX | ADX(14) ≥ eşik (trend gerçekten güçlü mü, yoksa yatay/gürültülü mü?) |
-| 7 | Göreli Güç | Son 20 günde **BIST100 endeksinden** daha güçlü performans |
+| 5 | Seviye | **Günlük en yüksek (High) fiyatlara dayalı** direnç kırılımı/yakınlığı ya da sıkışma (düşük volatilite) sonrası |
+| 6 | ADX | ADX(14) ≥ eşik — klasik Wilder formülüyle (tam, yaklaşık değil) hesaplanır |
+| 7 | Göreli Güç | Son 20 günde **BIST100 endeksinden** daha güçlü performans (endeks verisi alınamazsa bu kriter hesaplanamaz, azami puan 6'ya düşer) |
 
 **Risk cezaları (her biri -1, toplam puan 0'ın altına inmez):**
 
@@ -136,10 +152,13 @@ Uygulama üç kaynaktan hisse listesi alabilir (sol menüden seçilir):
   eşiği, minimum ortalama günlük ciro (likidite), düşük likiditeyi hariç
   tutma, geçmiş veri aralığı.
 - **Kodda sabit olan eşikler** (`app.py` başındaki sabitler): RSI bandı
-  (40-65), hacim çarpanı (1.3x), direnç toleransı (%2), aşırı uzama eşiği
+  (40-65), kırılım durumunda izin verilen üst RSI sınırı (`RSI_BREAKOUT_UPPER`,
+  80), hacim çarpanı (1.3x), direnç toleransı (%2), aşırı uzama eşiği
   (`OVEREXTENSION_PCT`, %10), marj sınırı eşiği (`NEAR_LIMIT_PCT`, %9),
   göreli güç bakış penceresi (20 gün), minimum backtest sinyal sayısı
-  (`MIN_BACKTEST_SIGNALS`, 5). Kendi stratejinize göre bu sabitleri
+  (`MIN_BACKTEST_SIGNALS`, 5), minimum tüm-evren backtest sinyal sayısı
+  (`MIN_AGGREGATE_BACKTEST_SIGNALS`, 30), şüpheli fiyat sıçraması eşiği
+  (`SUSPICIOUS_JUMP_PCT`, %30). Kendi stratejinize göre bu sabitleri
   değiştirebilirsiniz.
 - **Endeks referansı:** Göreli güç ve piyasa rejimi notu `INDEX_TICKER =
   "XU100.IS"` (BIST100) üzerinden hesaplanır; isterseniz başka bir endekse

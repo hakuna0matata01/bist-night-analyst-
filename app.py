@@ -66,6 +66,9 @@ OVEREXTENSION_PCT = 0.10    # EMA20'nin bu oranın üzerinde ise "aşırı uzam�
 NEAR_LIMIT_PCT = 9.0        # Günlük değişim bu yüzdeyi geçerse "marj sınırına yakın" say
 MIN_BACKTEST_SIGNALS = 5    # Tarihsel başarı oranını göstermek için gereken min. sinyal sayısı
 DEFAULT_TRIGGER_BUFFER_PCT = 0.5  # Giriş tetik seviyesi için referans direncin üzerine eklenen tampon (%)
+SUSPICIOUS_JUMP_PCT = 30.0  # Tek günlük |değişim| bu eşiği geçerse "olası ayarlanmamış kurumsal işlem" say
+MIN_AGGREGATE_BACKTEST_SIGNALS = 30  # Tüm-evren (cross-sectional) backtest için gereken min. sinyal-gün sayısı
+RSI_BREAKOUT_UPPER = 80     # Kırılım eşliğinde momentum için izin verilen üst RSI sınırı (aşırı alım sınırı)
 
 
 @st.cache_data(show_spinner=False)
@@ -147,14 +150,55 @@ def ema(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=span, adjust=False).mean()
 
 
+def _wilder_rma(x: np.ndarray, period: int) -> np.ndarray:
+    """Wilder'ın ORİJİNAL özyinelemeli düzleştirmesi (RMA).
+
+    pandas'ın ewm(alpha=1/period, adjust=False) yaklaşıklamasından farkı:
+    ewm ilk veri noktasından itibaren üstel ağırlıklandırma uygular ve kısa
+    geçmişlerde (örn. 6 aylık tarama) gerçek Wilder tanımından sapar (ilk
+    ~60-80 barda birkaç puana varan fark). Bu fonksiyon klasik tanımla
+    BİREBİR eşleşir: önce ilk `period` değerin basit ortalamasıyla başlar,
+    sonrasında prev*(period-1)/period + x/period ile günceller. Zincirleme
+    kullanımlarda (örn. ADX içinde DX'in kendisinin tekrar düzleştirilmesi)
+    girdi serisinin baştaki NaN'larını otomatik atlar.
+    """
+    n = len(x)
+    out = np.full(n, np.nan)
+    valid = ~np.isnan(x)
+    if not valid.any():
+        return out
+    s = int(np.argmax(valid))  # ilk geçerli (NaN olmayan) indeks
+    if s + period > n:
+        return out
+    seed = np.nanmean(x[s:s + period])
+    seed_idx = s + period - 1
+    out[seed_idx] = seed
+    prev = seed
+    for i in range(seed_idx + 1, n):
+        xi = x[i]
+        if np.isnan(xi):
+            out[i] = prev  # ender rastlanan eksik veri: son değeri taşı
+            continue
+        prev = (prev * (period - 1) + xi) / period
+        out[i] = prev
+    return out
+
+
 def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    """Wilder'ın orijinal (sabit-periyot basit ortalama ile başlatılan,
+    özyinelemeli) RSI tanımı — yaklaşıklama değil, tam formül."""
     delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    out = 100 - (100 / (1 + rs))
+    gain = delta.clip(lower=0).to_numpy()
+    loss = (-delta.clip(upper=0)).to_numpy()
+    avg_gain = _wilder_rma(gain, period)
+    avg_loss = _wilder_rma(loss, period)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rs = avg_gain / np.where(avg_loss == 0, np.nan, avg_loss)
+        out = 100 - (100 / (1 + rs))
+    out = pd.Series(out, index=series.index)
+    # Kayıp ortalaması tam sıfırsa (kesintisiz yükseliş) RSI=100 olmalı, NaN değil
+    pure_uptrend = (avg_loss == 0) & ~np.isnan(avg_gain) & (avg_gain > 0)
+    out[pure_uptrend] = 100.0
     return out.fillna(50)
 
 
@@ -167,6 +211,41 @@ def macd(series: pd.Series, fast=12, slow=26, signal=9):
     return macd_line, signal_line, hist
 
 
+def wilson_interval(n_positive: int, n_total: int, z: float = 1.96) -> tuple:
+    """Bir oranın (örn. tarihsel başarı oranı) %95 Wilson güven aralığını
+    hesaplar. Küçük örneklemlerde basit normal yaklaşıklıktan çok daha
+    güvenilirdir ve negatif/100'ü aşan aralık üretmez. (lo%, hi%) döner."""
+    if n_total <= 0:
+        return (np.nan, np.nan)
+    phat = n_positive / n_total
+    denom = 1 + z ** 2 / n_total
+    center = phat + z ** 2 / (2 * n_total)
+    margin = z * np.sqrt((phat * (1 - phat) + z ** 2 / (4 * n_total)) / n_total)
+    lo = max(0.0, (center - margin) / denom) * 100
+    hi = min(1.0, (center + margin) / denom) * 100
+    return (lo, hi)
+
+
+def detect_data_quality_issue(df: pd.DataFrame, threshold_pct: float = SUSPICIOUS_JUMP_PCT):
+    """BIST'te tek günlük fiyat hareketi fiili olarak ~%10 bandıyla sınırlı
+    olduğundan, bundan çok daha büyük tek-günlük bir sıçrama genellikle
+    gerçek bir fiyat hareketi değil, yfinance'in doğru geriye-ayarlamadığı
+    bir bedelsiz sermaye artırımı / bölünme gibi kurumsal bir işlemin izidir.
+    Böyle bir sıçrama EMA/RSI/ADX gibi tüm göstergeleri o noktadan itibaren
+    bozar; bu yüzden böyle hisseler analiz dışı bırakılır. (var_mı, sebep) döner.
+    """
+    chg = df["Close"].pct_change().abs() * 100
+    bad = chg[chg > threshold_pct]
+    if not bad.empty:
+        worst_date = bad.idxmax()
+        worst_val = bad.max()
+        return True, (
+            f"Şüpheli fiyat sıçraması: {worst_date.date()} tarihinde %{worst_val:.0f} "
+            "tek günlük değişim (olası ayarlanmamış bedelsiz/bölünme — veri güvenilmez)"
+        )
+    return False, None
+
+
 def bollinger_bandwidth(series: pd.Series, period: int = 20, num_std: float = 2.0) -> pd.Series:
     sma = series.rolling(period).mean()
     std = series.rolling(period).std()
@@ -176,27 +255,42 @@ def bollinger_bandwidth(series: pd.Series, period: int = 20, num_std: float = 2.
 
 
 def adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14):
-    """Wilder'ın ADX / +DI / -DI göstergesi (ewm ile yaklaşık Wilder smoothing)."""
-    up_move = high.diff()
-    down_move = -low.diff()
+    """Wilder'ın ADX / +DI / -DI göstergesi — _wilder_rma ile tam (yaklaşık
+    değil) klasik tanım. +DI/-DI oranı hem TR hem DM aynı şekilde
+    düzleştirildiği için ortaya sum-bazlı ya da average-bazlı Wilder
+    smoothing kullanılması fark etmez (oranda sabit çarpan sadeleşir); ADX
+    çizgisi ise DX serisinin kendisinin tekrar Wilder-ortalamasıdır."""
+    idx = high.index
+    high_v, low_v, close_v = high.to_numpy(), low.to_numpy(), close.to_numpy()
 
-    plus_dm = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), index=high.index)
-    minus_dm = pd.Series(np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=high.index)
+    up_move = np.diff(high_v, prepend=np.nan)
+    down_move = -np.diff(low_v, prepend=np.nan)
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+    plus_dm[0] = np.nan
+    minus_dm[0] = np.nan
 
-    prev_close = close.shift(1)
-    tr = pd.concat([
-        high - low,
-        (high - prev_close).abs(),
-        (low - prev_close).abs(),
-    ], axis=1).max(axis=1)
+    prev_close = np.roll(close_v, 1)
+    prev_close[0] = np.nan
+    tr = np.nanmax(np.vstack([
+        high_v - low_v,
+        np.abs(high_v - prev_close),
+        np.abs(low_v - prev_close),
+    ]), axis=0)
+    tr[0] = np.nan
 
-    atr = tr.ewm(alpha=1 / period, adjust=False).mean()
-    plus_di = 100 * plus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr.replace(0, np.nan)
-    minus_di = 100 * minus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr.replace(0, np.nan)
+    atr = _wilder_rma(tr, period)
+    plus_dm_s = _wilder_rma(plus_dm, period)
+    minus_dm_s = _wilder_rma(minus_dm, period)
 
-    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
-    adx_line = dx.ewm(alpha=1 / period, adjust=False).mean()
-    return adx_line, plus_di, minus_di
+    with np.errstate(divide="ignore", invalid="ignore"):
+        plus_di = 100 * plus_dm_s / np.where(atr == 0, np.nan, atr)
+        minus_di = 100 * minus_dm_s / np.where(atr == 0, np.nan, atr)
+        denom = plus_di + minus_di
+        dx = 100 * np.abs(plus_di - minus_di) / np.where(denom == 0, np.nan, denom)
+
+    adx_line = _wilder_rma(dx, period)
+    return pd.Series(adx_line, index=idx), pd.Series(plus_di, index=idx), pd.Series(minus_di, index=idx)
 
 
 # ----------------------------------------------------------------------------
@@ -222,9 +316,34 @@ def build_indicator_set(
     # 1. Trend: boğa dizilişi (sadece fiyat değil, EMA'ların sıralaması da)
     trend = (close > ema20) & (close > ema50) & (ema20 > ema50)
 
-    # 2. RSI momentum: 40-65 bandında ve 3 gün önceye göre yükseliyor
+    # 5. Seviye: direnç kırılımı / yakınlığı ya da sıkışma sonrası
+    # NOT: direnç artık kapanış değil, GÜNLÜK EN YÜKSEK (High) fiyatlara göre
+    # hesaplanıyor — gün içi fitilleri de hesaba katan, daha standart bir
+    # direnç tanımı (sadece kapanışlara bakmak gerçek direnci olduğundan
+    # düşük gösterebilirdi). Momentum kriteriyle tutarlılık için bu blok
+    # Trend'den hemen sonra, Momentum'dan ÖNCE hesaplanıyor (aşağıya bkz).
+    recent_high20 = high.shift(1).rolling(20).max()
+    breakout = close >= recent_high20
+    near_resistance = close >= recent_high20 * 0.98
+    bw_q20 = bw.rolling(60, min_periods=30).quantile(0.2)
+    squeeze = bw <= bw_q20
+    level_ok = breakout | near_resistance | squeeze
+
+    # 2. RSI momentum: iki ayrı senaryoyu kapsar —
+    #   a) "Erken/orta aşama" momentum: RSI 40-65 bandında ve yükseliyor
+    #      (henüz aşırı alım değil, trend yeni güçleniyor).
+    #   b) "Kırılım devamı" momentum: Seviye kriteri (breakout/direnç
+    #      yakınlığı/sıkışma) zaten sağlanmışsa ve RSI 65-80 arasında
+    #      yükseliyorsa da say. Gerçek kırılımlarda RSI doğal olarak 65'in
+    #      üzerine çıkar; eski kodda bu durum ceza görmeden sadece "momentum"
+    #      puanını kaybediyordu — bu da Seviye kriterini ödüllendirirken
+    #      Momentum kriterini aynı anda cezalandıran içsel bir çelişkiydi.
+    #      80 üzeri hâlâ aşırı-alım sayılıp hariç tutulur.
     rsi_prev3 = rsi14.shift(3)
-    momentum = (rsi14 >= 40) & (rsi14 <= 65) & (rsi14 > rsi_prev3)
+    rsi_rising = rsi14 > rsi_prev3
+    momentum_core = (rsi14 >= 40) & (rsi14 <= 65) & rsi_rising
+    momentum_breakout = level_ok & (rsi14 > 65) & (rsi14 <= RSI_BREAKOUT_UPPER) & rsi_rising
+    momentum = momentum_core | momentum_breakout
 
     # 3. MACD: sinyal üzerinde ve histogram güçleniyor
     hist_prev = hist.shift(1)
@@ -235,14 +354,6 @@ def build_indicator_set(
     vol_ratio = volume / vol_avg20.replace(0, np.nan)
     price_up = close > close.shift(1)
     volume_ok = (vol_ratio > 1.3) & price_up
-
-    # 5. Seviye: direnç kırılımı / yakınlığı ya da sıkışma sonrası
-    recent_high20 = close.shift(1).rolling(20).max()
-    breakout = close >= recent_high20
-    near_resistance = close >= recent_high20 * 0.98
-    bw_q20 = bw.rolling(60, min_periods=30).quantile(0.2)
-    squeeze = bw <= bw_q20
-    level_ok = breakout | near_resistance | squeeze
 
     # Giriş tetik seviyesi: "dünkü direncin birazı üzeri" — eğer hisse bugün zaten
     # kırılım yaptıysa (close >= recent_high20), referans olarak bugünün kapanışını
@@ -257,7 +368,8 @@ def build_indicator_set(
     adx_ok = adx14 >= adx_threshold
 
     # 7. Göreli güç: endeksten daha iyi performans (son 20 gün)
-    if index_close is not None and len(index_close) > 25:
+    index_available = index_close is not None and len(index_close) > 25
+    if index_available:
         idx_aligned = index_close.reindex(close.index, method="ffill")
         stock_ret20 = close / close.shift(20) - 1
         index_ret20 = idx_aligned / idx_aligned.shift(20) - 1
@@ -277,10 +389,10 @@ def build_indicator_set(
 
     criteria = {
         "Trend: Fiyat > EMA20 > EMA50 (boğa dizilişi)": trend,
-        "RSI(14) 40-65 bandında ve yükseliyor": momentum,
+        "RSI(14) 40-65 yükseliyor (veya kırılımda 65-80 yükseliyor)": momentum,
         "MACD sinyal üzerinde, histogram güçleniyor": macd_ok,
         "Hacim: 20g ort. 1.3x üzeri + fiyat yukarı": volume_ok,
-        "Seviye: direnç kırılımı/yakınlığı ya da sıkışma": level_ok,
+        "Seviye: direnç kırılımı/yakınlığı ya da sıkışma (High bazlı)": level_ok,
         f"ADX(14) ≥ {adx_threshold} (trend gerçekten güçlü)": adx_ok,
         "BIST100'den güçlü (20g göreli getiri > 0)": rs_ok,
     }
@@ -303,6 +415,7 @@ def build_indicator_set(
         "vol_ratio": vol_ratio, "recent_high20": recent_high20,
         "chg_pct": chg_pct, "avg_turnover20": avg_turnover20,
         "reference_level": reference_level, "entry_trigger": entry_trigger,
+        "index_available": index_available,
     }
 
 
@@ -334,21 +447,69 @@ def evaluate_today(ind: dict) -> tuple:
             (_safe(ind["entry_trigger"]) / _safe(ind["close"]) - 1) * 100
             if pd.notna(ind["entry_trigger"].iloc[idx]) and _safe(ind["close"]) else np.nan
         ),
+        "Azami Puan": MAX_POSITIVE_CRITERIA if ind.get("index_available", True) else MAX_POSITIVE_CRITERIA - 1,
     }
     return score, details, risk, metrics
 
 
 def backtest_hit_rate(ind: dict, threshold: int, min_signals: int = MIN_BACKTEST_SIGNALS) -> dict:
     """Bu hissenin kendi geçmişinde, aynı puan eşiğini geçtiği günlerden sonraki
-    günün getiri istatistiklerini hesaplar (vektörize, hızlı)."""
+    günün getiri istatistiklerini hesaplar (vektörize, hızlı). Tek hisseli
+    örneklemler küçük olduğundan, nokta tahminine ek olarak %95 Wilson güven
+    aralığı da döndürülür — böylece örn. "n=6, %83" gibi aslında çok geniş
+    belirsizlik taşıyan bir sonuç yanıltıcı kesinlikte sunulmaz."""
     close = ind["close"]
     fwd = close.pct_change().shift(-1) * 100
     tmp = pd.DataFrame({"score": ind["score_series"], "fwd": fwd}).dropna()
     hits = tmp.loc[tmp["score"] >= threshold, "fwd"]
     n = len(hits)
     if n < min_signals:
-        return {"n": n, "hit_rate": np.nan, "avg_return": np.nan}
-    return {"n": n, "hit_rate": float((hits > 0).mean() * 100), "avg_return": float(hits.mean())}
+        return {"n": n, "hit_rate": np.nan, "avg_return": np.nan, "ci_lo": np.nan, "ci_hi": np.nan}
+    n_pos = int((hits > 0).sum())
+    ci_lo, ci_hi = wilson_interval(n_pos, n)
+    return {
+        "n": n, "hit_rate": float(n_pos / n * 100), "avg_return": float(hits.mean()),
+        "ci_lo": ci_lo, "ci_hi": ci_hi,
+    }
+
+
+def aggregate_backtest_hit_rate(details_map: dict, threshold: int,
+                                 min_signals: int = MIN_AGGREGATE_BACKTEST_SIGNALS) -> dict:
+    """TÜM taranan hisselerin geçmişini birleştirip (cross-sectional / tüm
+    evren bazlı), puanı eşiği geçen her hisse-gün için ertesi gün getirisini
+    tek bir havuzda toplar. Tek hisse bazlı backtest'teki en büyük zayıflık
+    (n genelde 5-20 gibi çok küçük bir sayı) burada ortadan kalkar: yüzlerce
+    hisse x yüzlerce gün birleşince örneklem çok daha büyük ve puanlama
+    sisteminin GENEL geçerliliği hakkında istatistiksel olarak daha anlamlı
+    bir gösterge elde edilir. Yine de bu sinyaller zaman ve hisseler arasında
+    bağımsız değildir (aynı gün birçok hisse birlikte hareket edebilir), bu
+    yüzden Wilson aralığı yine de temkinli yorumlanmalıdır."""
+    pooled_frames = []
+    for ticker, payload in details_map.items():
+        ind = payload[3]
+        close = ind["close"]
+        fwd = close.pct_change().shift(-1) * 100
+        tmp = pd.DataFrame({"score": ind["score_series"], "fwd": fwd}).dropna()
+        hits = tmp.loc[tmp["score"] >= threshold, "fwd"]
+        if not hits.empty:
+            pooled_frames.append(hits)
+
+    n_stocks_with_signal = len(pooled_frames)
+    if not pooled_frames:
+        return {"n": 0, "n_stocks": 0, "hit_rate": np.nan, "avg_return": np.nan, "ci_lo": np.nan, "ci_hi": np.nan}
+
+    pooled = pd.concat(pooled_frames)
+    n = len(pooled)
+    if n < min_signals:
+        return {"n": n, "n_stocks": n_stocks_with_signal, "hit_rate": np.nan, "avg_return": np.nan,
+                "ci_lo": np.nan, "ci_hi": np.nan}
+
+    n_pos = int((pooled > 0).sum())
+    ci_lo, ci_hi = wilson_interval(n_pos, n)
+    return {
+        "n": n, "n_stocks": n_stocks_with_signal, "hit_rate": float(n_pos / n * 100),
+        "avg_return": float(pooled.mean()), "ci_lo": ci_lo, "ci_hi": ci_hi,
+    }
 
 
 def score_color(val) -> str:
@@ -480,6 +641,8 @@ if run:
     rows = []
     details_map = {}
     failed = []
+    quality_issues = []
+    index_available = index_close is not None and len(index_close) > 25
 
     progress = st.progress(0, text="Analiz ediliyor...")
     total = len(tickers)
@@ -489,6 +652,10 @@ if run:
         if df is None or len(df) < MIN_BARS_REQUIRED:
             failed.append((ticker, "Veri yok / yetersiz"))
         else:
+            bad, reason = detect_data_quality_issue(df)
+            if bad:
+                quality_issues.append((ticker, reason))
+                continue
             try:
                 ind = build_indicator_set(df, index_close, adx_threshold, trigger_buffer_pct)
                 score, details, risk, metrics = evaluate_today(ind)
@@ -503,6 +670,9 @@ if run:
                     "Tarihsel Başarı %": bt["hit_rate"],
                     "Sinyal Sayısı": bt["n"],
                     "Ort. Sonraki Gün Getiri %": bt["avg_return"],
+                    "Başarı %95 GA": (
+                        f"{bt['ci_lo']:.0f}–{bt['ci_hi']:.0f}" if pd.notna(bt.get("ci_lo", np.nan)) else "—"
+                    ),
                 }
                 rows.append(row)
                 details_map[ticker] = (details, risk, df, ind, bt)
@@ -521,13 +691,18 @@ if run:
     else:
         results_df = pd.DataFrame()
 
+    agg_bt = aggregate_backtest_hit_rate(details_map, min_score)
+
     st.session_state.scan = {
         "results": results_df,
         "details": details_map,
         "failed": failed,
+        "quality_issues": quality_issues,
         "index_close": index_close,
+        "index_available": index_available,
         "min_score": min_score,
         "exclude_illiquid": exclude_illiquid,
+        "agg_backtest": agg_bt,
         "timestamp": datetime.now().strftime("%d.%m.%Y %H:%M"),
     }
 
@@ -557,7 +732,45 @@ else:
                 f"Son kapanış değişimi: {idx_chg:+.2f}%",
             )
     else:
-        st.caption("ℹ️ Endeks verisi alınamadı; göreli güç kriteri ve piyasa rejimi notu bu taramada eksik olabilir.")
+        st.error(
+            "⚠️ BIST100 endeks verisi alınamadı! 'Göreli Güç' kriteri bu taramada hiçbir hisse için "
+            f"hesaplanamadı — dolayısıyla bu taramadaki azami puan 7 değil **{MAX_POSITIVE_CRITERIA - 1}** "
+            "olarak değerlendirilmelidir. Puanları buna göre yorumlayın veya taramayı tekrar deneyin.",
+            icon="⚠️",
+        )
+
+    # --- Tüm evren bazlı (cross-sectional) tarihsel doğrulama ---
+    agg_bt = scan.get("agg_backtest")
+    if agg_bt is not None:
+        if pd.notna(agg_bt.get("hit_rate", np.nan)):
+            st.info(
+                f"📐 **Tüm evren bazlı tarihsel doğrulama** (puan ≥ {scan['min_score']}, "
+                f"{agg_bt['n_stocks']} farklı hissenin geçmişi birleştirilerek): "
+                f"**{agg_bt['n']}** hisse-gün sinyali bulundu, bunların **%{agg_bt['hit_rate']:.0f}'i** "
+                f"ertesi gün pozitif kapandı (%95 güven aralığı: **{agg_bt['ci_lo']:.0f}–{agg_bt['ci_hi']:.0f}**), "
+                f"ortalama ertesi gün getirisi **{agg_bt['avg_return']:+.2f}%**. "
+                "Tek hisse bazlı backtest'ten çok daha büyük bir örneklem olduğu için puanlama "
+                "sisteminin genel geçerliliği hakkında daha güvenilir bir fikir verir — ama sinyaller "
+                "aynı gün birçok hissede birlikte tetiklenebildiğinden (bağımsız değildir), yine de "
+                "temkinli yorumlanmalıdır.",
+                icon="📐",
+            )
+        else:
+            st.caption(
+                f"ℹ️ Tüm evren bazlı doğrulama için yeterli sinyal yok (bulunan: {agg_bt['n']}, "
+                f"gereken minimum: {MIN_AGGREGATE_BACKTEST_SIGNALS}). Daha fazla hisse veya daha uzun "
+                "bir veri aralığı deneyin."
+            )
+
+    if scan.get("quality_issues"):
+        with st.expander(f"🚫 Veri kalitesi nedeniyle hariç tutulan {len(scan['quality_issues'])} hisse"):
+            st.caption(
+                "Bu hisselerde yfinance'in doğru ayarlamadığı bir bedelsiz sermaye artırımı/bölünme "
+                "gibi bir kurumsal işlem izi tespit edildi; tüm göstergeler bu noktadan itibaren "
+                "bozulabileceği için analiz dışı bırakıldı."
+            )
+            for t, reason in scan["quality_issues"]:
+                st.write(f"- {t}: {reason}")
 
     if results_df.empty:
         st.warning("Hiçbir hisse için analiz tamamlanamadı. Hisse kodlarını ve bağlantıyı kontrol edin.")
@@ -572,7 +785,7 @@ else:
             "Hisse", "Puan", "Kapanış", "Değişim %",
             "Giriş Tetik Fiyatı", "Tetiğe Uzaklık %", "Referans Direnç",
             "RSI(14)", "ADX(14)", "Hacim Oranı", "Gör. Güç 20g %", "Ort. Ciro (M TL)",
-            "Tarihsel Başarı %", "Sinyal Sayısı", "Ort. Sonraki Gün Getiri %",
+            "Tarihsel Başarı %", "Başarı %95 GA", "Sinyal Sayısı", "Ort. Sonraki Gün Getiri %",
         ]
         fmt = {
             "Kapanış": "{:.2f}", "Değişim %": "{:+.2f}",
@@ -617,7 +830,10 @@ else:
             details, risk, df, ind, bt = scan["details"][chosen_ticker]
             row = results_df[results_df["Hisse"] == chosen].iloc[0]
 
-            st.write(f"**Puan: {int(row['Puan'])} / {MAX_POSITIVE_CRITERIA}** (risk cezaları sonrası)")
+            azami = int(row["Azami Puan"]) if pd.notna(row.get("Azami Puan", np.nan)) else MAX_POSITIVE_CRITERIA
+            st.write(f"**Puan: {int(row['Puan'])} / {azami}** (risk cezaları sonrası)")
+            if azami < MAX_POSITIVE_CRITERIA:
+                st.caption("ℹ️ Endeks verisi alınamadığı için azami puan bu taramada 7 değil 6.")
 
             trig_cols = st.columns(3)
             trig_cols[0].metric("Giriş Tetik Fiyatı", f"{row['Giriş Tetik Fiyatı']:.2f} TL")
@@ -641,7 +857,9 @@ else:
                 st.info(
                     f"📈 **Tarihsel performans** (bu hissede puan ≥ {min_score_used} olan geçmiş günler): "
                     f"{bt['n']} sinyal bulundu, bunların **%{bt['hit_rate']:.0f}'i** ertesi gün pozitif "
-                    f"kapandı, ortalama ertesi gün getirisi **{bt['avg_return']:+.2f}%**.",
+                    f"kapandı (%95 güven aralığı: **{bt['ci_lo']:.0f}–{bt['ci_hi']:.0f}**), ortalama ertesi "
+                    f"gün getirisi **{bt['avg_return']:+.2f}%**. Düşük sinyal sayısında bu aralık çok "
+                    "geniş olabilir — tek başına karar vermek için yeterli değildir.",
                 )
             else:
                 st.caption(
