@@ -1,20 +1,52 @@
-# BIST Akşam Taraması — Faz 1
+# BIST Akşam Taraması — Faz 1 (v4)
 
-## v3 — Teknik Analiz Doğruluğunu Güçlendiren Düzenlemeler
+## v4 — Sağlamlık, Dürüst Backtest ve Test Altyapısı
 
-Bağımsız bir kod incelemesinde tespit edilen noktalara karşı yapılan değişiklikler:
+**Azami puan nedir?** Pozitif kriter sayısı **7**'dir; iki risk cezası yalnızca puanı düşürür, hiçbir
+zaman artırmaz. Dolayısıyla azami puan **7**'dir. **6** değeri yalnızca BIST100 endeksi alınamadığında
+görülür (Göreli Güç kriteri hesaplanamaz) ve arayüz bunu açıkça uyarır.
 
-| # | Sorun | Çözüm |
-|---|-------|-------|
-| 1 | RSI/ADX, pandas `ewm(alpha=1/period)` ile **yaklaşık** Wilder smoothing kullanıyordu (kısa dönemlerde ~1 puana varan sapma) | `_wilder_rma()` ile klasik, SMA ile başlatılan **tam** Wilder özyinelemesi uygulandı. Sentetik veriyle test edildi: RSI artık klasik referansla **birebir** (fark = 0.0), ADX farkı 50. bardan sonra <0.2 puan |
-| 2 | Direnç seviyesi sadece **kapanış** fiyatlarına dayanıyordu, gün içi fitilleri yok sayıyordu | `recent_high20` artık **High** (günlük en yüksek) fiyatlara dayanıyor — daha standart bir direnç/kırılım tanımı |
-| 3 | Momentum kriteri (RSI 40-65) ile Seviye kriteri (direnç kırılımı) çelişiyordu: gerçek bir kırılım genelde RSI'ı 65'in üzerine taşır ve momentum puanını "cezalandırırdı" | Momentum artık iki senaryoyu kapsıyor: erken/orta aşama (RSI 40-65, yükseliyor) **veya** kırılım devamı (Seviye kriteri sağlanmışsa RSI 65-80 arası, yükseliyor). 80 üzeri hâlâ aşırı-alım sayılır |
-| 4 | Tarihsel başarı oranı tek hissenin kendi geçmişiyle sınırlıydı (n genelde 5-20, istatistiksel olarak zayıf) | Yeni **"Tüm evren bazlı tarihsel doğrulama"** paneli: taranan tüm hisselerin sinyal-günleri birleştirilip (cross-sectional) çok daha büyük bir örneklemle genel geçerlilik ölçülüyor. Hem tek-hisse hem tüm-evren sonuçlarına **%95 Wilson güven aralığı** eklendi (küçük örneklemde yanıltıcı kesinlik vermez) |
-| 5 | Yahoo Finance'in doğru ayarlamadığı bedelsiz sermaye artırımı/bölünme gibi olaylar, tüm göstergeleri (EMA/RSI/ADX) sessizce bozabiliyordu | Yeni `detect_data_quality_issue()`: tek günlük değişim %30'u geçerse (BIST'in fiili ±%10 bandının çok üzerinde) hisse "veri kalitesi sorunu" olarak işaretlenip analiz dışı bırakılıyor, ayrı bir listede gösteriliyor |
-| 6 | BIST100 endeksi çekilemezse, Göreli Güç kriteri sessizce devre dışı kalıyor ama arayüzde küçük bir notla geçiştiriliyordu | Artık belirgin bir uyarı (`st.error`) gösteriliyor ve o taramadaki **azami puanın 7 değil 6 olduğu** hem üstte hem her hissenin detay panelinde açıkça belirtiliyor |
+| # | Zayıflık | Çözüm |
+|---|----------|-------|
+| 1 | Hisse indeksi tz'li, endeks tz'siz gelince `reindex` hata verip **tüm hisseleri sessizce düşürebiliyordu** | `normalize_index()` ile tüm seriler tz'siz günlüğe çevrilir |
+| 2 | Tek hisse indirmede (ör. "Kendi listem"de tek kod) yfinance'in çok seviyeli sütunu `KeyError` ile hisseyi kaybettiriyordu | `extract_ticker_frame()` her iki sütun biçimini de işler |
+| 3 | Geçici Yahoo hatası **2 saat boyunca önbelleğe** alınıyordu; hata nedeni gizleniyordu | Grup başına 3 deneme + eksikler için ikinci geçiş; tam başarısızlık önbelleğe alınmaz, neden listelenir |
+| 4 | Seans bitmeden çalıştırılınca **yarım mum** hesaba giriyordu | 18:15 TSİ öncesi bugünkü mum otomatik hariç tutulur, kullanıcı bilgilendirilir |
+| 5 | İşlem görmeyen/askıdaki hisse eski veriyle puanlanıyordu | Son veri evrenin gerisindeyse ya da son gün hacim 0 ise "analiz edilemedi" |
+| 6 | Eski bir bedelsiz izi hisseyi tümden dışarıda bırakıyordu | Son sıçramadan sonrası yeterliyse geçmiş kırpılıp analiz sürer (liste halinde gösterilir) |
+| 7 | ADX yalnızca **güç** ölçer, yön değil; düşüş trendinde de puan verebilirdi | ADX puanı için `+DI > −DI` şartı eklendi (`ADX_REQUIRE_DI_DIRECTION`) |
+| 8 | Yönsüz Bollinger sıkışması tek başına "Seviye" puanı veriyordu | Sıkışma yalnızca fiyat EMA20 üzerindeyken sayılır (`SQUEEZE_REQUIRES_BULLISH`) |
+| 9 | RSI ısınma dönemi 50'ye doldurulup sahte değerler üretiyordu | Isınma NaN kalır; backtest ilk 60 barı atlar |
+| 10 | Backtest "sinyal kapanışından ertesi kapanışa" ölçüyordu — **fiilen yapılamayan** bir işlem | Ek **tetik bazlı** senaryo: ertesi gün tetik görülürse tetik/açılıştan alım, kapanışta satım; tavan açılış hariç; işlem maliyeti düşülür |
+| 11 | Başarı oranı **baz oran olmadan** yorumlanıyordu | Tüm hisse-günlerinden baz oran ve **fark (lift)** gösterilir |
+| 12 | Aynı gün çıkan sinyaller bağımsız değil; Wilson aralığı fazla dar kalıyordu | Tüm-evren için **gün-kümelenmeli** güven aralığı |
+| 13 | Puanın gerçekten ayırt edici olup olmadığı görülemiyordu | "Puan basamağına göre sonuçlar" tablosu (yüksek puan gerçekten daha mı iyi?) |
+| 14 | Min. puan/likidite gibi filtreler değişince **yeniden tarama** gerekiyordu | Görüntüleme filtreleri anında uygulanır; tarihsel özetler havuzdan türetilir |
+| 15 | Eşit puanda sıralama gürültülü "tarihsel başarı"ya dayanıyordu | Seçilebilir ölçüt (göreli güç, ciro, hacim oranı, tetiğe yakınlık) |
+| 16 | `requirements.txt` (`streamlit>=1.38`) kodun kullandığı `width="stretch"` ile uyumsuzdu | `streamlit>=1.50`, `pandas>=2.1` |
+| 17 | Grafikte MACD ve ±DI yoktu, hafta sonu boşlukları vardı | MACD ve ±DI panelleri, hafta sonu boşlukları kaldırıldı |
+| 18 | Mantık arayüze gömülüydü, test yoktu | `engine.py` ayrıldı; `tests/` altında 22 test (nedensellik/look-ahead, azami puan, tetik matematiği, veri hijyeni) |
 
-Bu değişiklikler puanlama **felsefesini** değiştirmez (hâlâ kural tabanlı bir ön-eleme aracıdır), sadece hesaplamaların standart tanımlarla tam örtüşmesini ve istatistiksel iddiaların (başarı oranı gibi) daha dürüst sunulmasını sağlar.
+> **Kural değişikliği uyarısı:** 7 ve 8 numaralı maddeler puanlama kurallarını bilinçli olarak biraz
+> daha seçici yapar. v3 davranışına dönmek için `engine.py` başındaki iki anahtarı `False` yapın.
+>
+> **Hâlâ geçerli sınırlar:** hisse listesi bugünün hisseleridir (hayatta kalma yanlılığı sonuçları
+> iyimser gösterebilir); Yahoo verisi gecikmeli/gayri resmi olabilir; tetik backtest'i emir derinliğini
+> ve tavan/taban kilitlerini tam modellemez.
 
+## Testler
+
+```bash
+pip install -r requirements-dev.txt
+pytest -q
+```
+
+## Proje Yapısı
+
+- `app.py` — Streamlit arayüzü, veri indirme (yeniden deneme/önbellek), sunum
+- `engine.py` — göstergeler, puanlama, veri hijyeni, backtest (Streamlit'ten bağımsız)
+- `tests/test_engine.py` — motor testleri
+- `data/bist_tickers.txt` — tarama evreni
 
 Piyasa kapandıktan sonra (örn. saat 20:00) çalıştırılan, BIST hisselerini
 teknik kriterlere göre puanlayıp ertesi gün için kısa bir **izleme listesi**
@@ -23,7 +55,7 @@ teknik kriterlere göre puanlayıp ertesi gün için kısa bir **izleme listesi*
 > ⚠️ Bu araç yatırım tavsiyesi değildir. Sadece teknik kriterlere dayalı bir
 > ön-eleme/tarama aracıdır.
 
-## Puanlama Mantığı (v3 — maks. 7 puan, risk cezalı; endeks verisi yoksa azami 6)
+## Puanlama Mantığı (v4 — azami 7 puan, risk cezalı; endeks verisi yoksa azami 6)
 
 **Pozitif kriterler (her biri +1):**
 
@@ -33,8 +65,8 @@ teknik kriterlere göre puanlayıp ertesi gün için kısa bir **izleme listesi*
 | 2 | Momentum | RSI(14) 40-65 bandında ve yükseliyor **veya** (Seviye kriteri sağlanmışsa) RSI 65-80 arası ve yükseliyor |
 | 3 | MACD | MACD çizgisi sinyalin üzerinde, histogram güçleniyor |
 | 4 | Hacim | Günlük hacim 20g ortalamanın **1.3x** üzerinde + fiyat yukarı |
-| 5 | Seviye | **Günlük en yüksek (High) fiyatlara dayalı** direnç kırılımı/yakınlığı ya da sıkışma (düşük volatilite) sonrası |
-| 6 | ADX | ADX(14) ≥ eşik — klasik Wilder formülüyle (tam, yaklaşık değil) hesaplanır |
+| 5 | Seviye | **Günlük en yüksek (High) fiyatlara dayalı** direnç kırılımı/yakınlığı ya da **yükseliş yanlı** sıkışma (düşük volatilite + fiyat > EMA20) |
+| 6 | ADX | ADX(14) ≥ eşik **ve +DI > −DI** (güç + yön) — klasik Wilder formülüyle hesaplanır |
 | 7 | Göreli Güç | Son 20 günde **BIST100 endeksinden** daha güçlü performans (endeks verisi alınamazsa bu kriter hesaplanamaz, azami puan 6'ya düşer) |
 
 **Risk cezaları (her biri -1, toplam puan 0'ın altına inmez):**
@@ -52,11 +84,11 @@ teknik kriterlere göre puanlayıp ertesi gün için kısa bir **izleme listesi*
   belirlenen eşiğin altındaki hisseler izleme listesinden (isteğe bağlı,
   varsayılan açık) hariç tutulur — ince/az işlem gören hisselerde teknik
   sinyaller güvenilmezdir ve pratikte alım/satımı da zor olabilir.
-- **Tarihsel Başarı Oranı:** Her hissenin **kendi geçmiş verisinde**, aynı
-  puan eşiğini geçtiği günlerden sonraki günün pozitif kapanma oranı ve
-  ortalama getirisi hesaplanır (vektörize mini-backtest). Yeterli sinyal
-  yoksa (<5) "—" gösterilir. **Bu geçmiş performanstır, gelecekteki sonucu
-  garanti etmez.**
+- **Tarihsel doğrulama:** Tüm taranan hisselerin geçmişi (ısınma sonrası) tek havuzda toplanır.
+  Her sinyal için iki ölçüt verilir: (a) sinyal kapanışından ertesi kapanışa **brüt** getiri/pozitif oranı,
+  (b) **tetik bazlı** gerçekçi senaryo (ertesi gün tetik görülürse alım, kapanışta satım, tur başına
+  2× işlem maliyeti düşülür). Sonuçlar **baz oranla** kıyaslanır; aralıklar tüm evrende gün-kümelenmeli,
+  tek hissede Wilson aralığıdır. **Bu geçmiş performanstır, gelecekteki sonucu garanti etmez.**
 
 ## Giriş Tetik Seviyesi
 
@@ -87,7 +119,7 @@ olarak eklenebilir.
 
 ```bash
 git clone <repo-url>
-cd bist-screener
+cd bist-night-analyst
 python -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
@@ -138,7 +170,7 @@ Uygulama üç kaynaktan hisse listesi alabilir (sol menüden seçilir):
 
 - İndirme, Yahoo Finance hız sınırlarını aşmamak için **100'lük gruplar**
   halinde ve paralel (`threads=True`) yapılır (`DOWNLOAD_CHUNK_SIZE` ile
-  `app.py` içinden ayarlanabilir).
+  `app.py` içinden ayarlanabilir; her grup 3 kez denenir).
 - Sonuçlar **2 saat** boyunca önbellekte tutulur (`fetch_batch` üzerindeki
   `ttl=7200`); aynı akşam tekrar tekrar basmanıza gerek kalmaz.
 - Likit olmayan/az işlem gören bazı kodlarda veri gelmeyebilir; bunlar
@@ -148,10 +180,10 @@ Uygulama üç kaynaktan hisse listesi alabilir (sol menüden seçilir):
 
 ## Özelleştirme
 
-- **Arayüzden canlı ayarlanabilenler:** minimum puan eşiği, minimum ADX
-  eşiği, minimum ortalama günlük ciro (likidite), düşük likiditeyi hariç
-  tutma, geçmiş veri aralığı.
-- **Kodda sabit olan eşikler** (`app.py` başındaki sabitler): RSI bandı
+- **Arayüzden ayarlanabilenler:** yeniden tarama gerektirenler — hisse listesi, veri aralığı, ADX eşiği,
+  tetik tamponu; **anında uygulananlar** — minimum puan, likidite eşiği/hariç tutma, eşit puan sıralaması,
+  işlem maliyeti.
+- **Kodda sabit olan eşikler** (`engine.py` başındaki sabitler): RSI bandı
   (40-65), kırılım durumunda izin verilen üst RSI sınırı (`RSI_BREAKOUT_UPPER`,
   80), hacim çarpanı (1.3x), direnç toleransı (%2), aşırı uzama eşiği
   (`OVEREXTENSION_PCT`, %10), marj sınırı eşiği (`NEAR_LIMIT_PCT`, %9),
@@ -180,8 +212,7 @@ resmi veri kaynaklarıyla teyit edin.
 - Faz 2 (sabah RVOL teyidi + VWAP kontrolü) için ayrı bir sayfa/sekme eklemek
 - Tarama sonuçlarını otomatik olarak her akşam GitHub Actions ile çalıştırıp
   sonucu bir CSV/Telegram bildirimi olarak almak
-- Walk-forward / tüm-liste genelinde toplu backtest (şu an her hissenin
-  kendi geçmişiyle sınırlı; sektörler arası veya tüm BIST genelinde
-  karşılaştırmalı bir backtest eklenebilir)
+- Walk-forward (zaman içinde eşik optimizasyonu olmadan, yalnızca dönemsel kararlılık) doğrulama
+- Hayatta kalma yanlılığını gidermek için tarihsel hisse listeleri
 - Sektör bazlı gruplama ve sektör göreli gücü (tek tek hisse yerine sektör
   rotasyonunu da dikkate almak)
