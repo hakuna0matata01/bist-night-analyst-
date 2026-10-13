@@ -611,6 +611,11 @@ with st.sidebar:
     st.caption("Daha uzun aralık, tarihsel başarı oranı için daha güvenilir örneklem sağlar.")
 
     min_score = st.slider(f"Minimum puan filtresi (0-{MAX_POSITIVE_CRITERIA})", 0, MAX_POSITIVE_CRITERIA, 4)
+    st.caption(
+        f"{MAX_POSITIVE_CRITERIA}, endeks verisi alınabildiği taramalardaki azami puandır — "
+        "endeks verisi alınamazsa tarama sonrası bu taramaya özel azami puanın 6'ya düştüğünü "
+        "belirten bir uyarı üstte gösterilir."
+    )
 
     st.subheader("Gelişmiş Filtreler")
     adx_threshold = st.slider("Minimum ADX(14) — trend gücü eşiği", 10, 40, 20)
@@ -715,8 +720,25 @@ else:
     st.caption(f"Son tarama: {scan['timestamp']}")
 
     # --- Piyasa rejimi bilgi panosu ---
+    # ÖNEMLİ: "azami puan" uyarısı, puanlamada GERÇEKTEN kullanılan aynı
+    # `index_available` bayrağına (build_indicator_set ile aynı eşik, >25 bar)
+    # dayanır — EMA50 rejim panosu için gereken ayrı ve daha sıkı (>=50 bar)
+    # eşikle KARIŞTIRILMAZ. Önceki sürümde bu iki ayrı eşik aynı anda, tek bir
+    # if/else içinde kullanıldığından, endeks verisi 26-49 bar gibi "Göreli
+    # Güç kriterini hesaplamaya yeter ama EMA50 rejim panosu için yetmez"
+    # bir aralıkta kaldığında ekranda "azami puan 6" uyarısı çıkıyor, ama
+    # puanlama aslında 7 üzerinden devam ediyordu (bildirdiğiniz hata buydu).
     idx_close = scan.get("index_close")
-    if idx_close is not None and len(idx_close) >= 50:
+    index_available = scan.get("index_available", False)
+
+    if not index_available:
+        st.error(
+            "⚠️ BIST100 endeks verisi alınamadı! 'Göreli Güç' kriteri bu taramada hiçbir hisse için "
+            f"hesaplanamadı — dolayısıyla bu taramadaki azami puan 7 değil **{MAX_POSITIVE_CRITERIA - 1}** "
+            "olarak değerlendirilmelidir. Puanları buna göre yorumlayın veya taramayı tekrar deneyin.",
+            icon="⚠️",
+        )
+    elif len(idx_close) >= 50:
         idx_ema50 = ema(idx_close, 50)
         idx_up = bool(idx_close.iloc[-1] > idx_ema50.iloc[-1])
         idx_chg = float((idx_close.iloc[-1] / idx_close.iloc[-2] - 1) * 100) if len(idx_close) > 1 else 0.0
@@ -732,11 +754,11 @@ else:
                 f"Son kapanış değişimi: {idx_chg:+.2f}%",
             )
     else:
-        st.error(
-            "⚠️ BIST100 endeks verisi alınamadı! 'Göreli Güç' kriteri bu taramada hiçbir hisse için "
-            f"hesaplanamadı — dolayısıyla bu taramadaki azami puan 7 değil **{MAX_POSITIVE_CRITERIA - 1}** "
-            "olarak değerlendirilmelidir. Puanları buna göre yorumlayın veya taramayı tekrar deneyin.",
-            icon="⚠️",
+        # Göreli Güç kriteri hesaplanabildi (azami puan hâlâ 7) ama endeks
+        # geçmişi EMA50 bazlı piyasa rejimi notu için yetersiz (<50 bar).
+        st.caption(
+            f"ℹ️ Endeks geçmişi sınırlı ({len(idx_close)} bar): Göreli Güç kriteri hesaplanabildi "
+            "(azami puan hâlâ 7), ancak EMA50 bazlı piyasa rejimi notu için yeterli veri yok."
         )
 
     # --- Tüm evren bazlı (cross-sectional) tarihsel doğrulama ---
